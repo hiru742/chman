@@ -1,10 +1,11 @@
 import os
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pymongo import MongoClient
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from telethon import TelegramClient, events
-from aiohttp import web
 
 # Configuration
 BOT_TOKEN = "8033242534:AAFN1AniUtwL7cz56B05XKxYgeZVTiyNRZY"
@@ -28,6 +29,24 @@ logger = logging.getLogger(__name__)
 # Telethon client
 telethon_client = TelegramClient('session_name', API_ID, API_HASH)
 
+# Dummy HTTP server for health checks
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/health':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'OK')
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+def run_http_server():
+    server_address = ('', 8000)  # Listen on all interfaces, port 8000
+    httpd = HTTPServer(server_address, HealthCheckHandler)
+    logger.info("Starting dummy HTTP server on port 8000...")
+    httpd.serve_forever()
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Bot started!")
 
@@ -40,10 +59,12 @@ async def handle_new_channel_message(event):
         except Exception as e:
             logger.error(f"Failed to forward message to user {user['user_id']}: {e}")
 
-async def health_check(request):
-    return web.Response(text="OK")
-
 def main():
+    # Start the HTTP server in a separate thread
+    http_thread = threading.Thread(target=run_http_server)
+    http_thread.daemon = True  # Daemonize thread to exit when the main program exits
+    http_thread.start()
+
     # Start the Telethon client
     telethon_client.start()
     telethon_client.run_until_disconnected()
@@ -56,11 +77,6 @@ def main():
 
     # Register the event handler for new channel messages
     telethon_client.on(events.NewMessage(chats=CHANNEL_USERNAME))(handle_new_channel_message)
-
-    # Start the HTTP server for health checks
-    app = web.Application()
-    app.router.add_get('/health', health_check)
-    web.run_app(app, port=8000)
 
     # Start the bot
     application.run_polling()
