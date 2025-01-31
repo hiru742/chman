@@ -1,94 +1,135 @@
-import os
 import logging
 import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from flask import Flask
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
 from pymongo import MongoClient
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-from telethon import TelegramClient, events
+import os
 
-# Configuration
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-MONGODB_URI = os.getenv('MONGODB_URI')
-FORCE_SUB_GROUP_LINK = os.getenv('FORCE_SUB_GROUP_LINK')
-ADMIN_USER_ID = int(os.getenv('ADMIN_USER_ID'))
-API_ID = os.getenv('API_ID')
-API_HASH = os.getenv('API_HASH')
-CHANNEL_USERNAME = os.getenv('CHANNEL_USERNAME')
+# Load environment variables
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+MONGO_URI = os.getenv("MONGO_URI")
+CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
+FORCESUB_GROUP_ID = int(os.getenv("FORCESUB_GROUP_ID"))
+FORCESUB_INVITE_LINK = os.getenv("FORCESUB_INVITE_LINK")
 
-# MongoDB setup
-client = MongoClient(MONGODB_URI)
-db = client.telegram_bot
-users_collection = db.users
-messages_collection = db.messages
+# MongoDB Setup
+client = MongoClient(MONGO_URI)
+db = client["telegram_bot"]
+users_collection = db["users"]
 
-# Logging
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Logging Setup
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-# Telethon client
-telethon_client = TelegramClient('session_name', API_ID, API_HASH)
+async def start(update: Update, context: CallbackContext):
+    """Handles /start command"""
+    user = update.effective_user
+    chat_id = user.id
 
-# Dummy HTTP server for health checks
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == '/health':
-            self.send_response(200)
-            self.send_header('Content-type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(b'OK')
-        else:
-            self.send_response(404)
-            self.end_headers()
+    member = await context.bot.get_chat_member(FORCESUB_GROUP_ID, chat_id)
+    if member.status in ["left", "kicked"]:
+        keyboard = [
+            [InlineKeyboardButton("Join Group", url=FORCESUB_INVITE_LINK)],
+            [InlineKeyboardButton("Try Again", callback_data="check_subscription")]
+        ]
+        await update.message.reply_text(
+            "⚠️ You must join our group to use this bot.",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+    
+    if not users_collection.find_one({"user_id": chat_id}):
+        users_collection.insert_one({"user_id": chat_id})
+    
+    await update.message.delete()
 
-def run_http_server():
-    server_address = ('', 8000)  # Listen on all interfaces, port 8000
-    httpd = HTTPServer(server_address, HealthCheckHandler)
-    logger.info("Starting dummy HTTP server on port 8000...")
-    httpd.serve_forever()
+async def check_subscription(update: Update, context: CallbackContext):
+    """Handles the Try Again button"""
+    query = update.callback_query
+    chat_id = query.from_user.id
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"Received /start command from user {update.message.from_user.id}")
-    await update.message.reply_text("Bot started!")
+    member = await context.bot.get_chat_member(FORCESUB_GROUP_ID, chat_id)
+    if member.status in ["member", "administrator", "creator"]:
+        await query.message.edit_text("✅ You have joined the group! You can now use the bot.")
+    else:
+        await query.answer("❌ You haven't joined yet. Please join and try again.", show_alert=True)
 
-async def handle_new_channel_message(event):
-    logger.info(f"New message in channel: {event.message.text}")
-    # Forward new channel messages to bot users
-    users = users_collection.find()
-    for user in users:
-        try:
-            await telethon_client.forward_messages(user['user_id'], event.message)
-            logger.info(f"Forwarded message to user {user['user_id']}")
-        except Exception as e:
-            logger.error(f"Failed to forward message to user {user['user_id']}: {e}")
+async def forward_channel_message(update: Update, context: CallbackContext):
+    """Forwards messages from the channel to all users"""
+    message = update.channel_post
+    text = message.text or message.caption
+
+    if text:
+        users = users_collection.find({})
+        for user in users:
+            chat_id = user["user_id"]
+            try:
+                await context.bot.send_message(chat_id, text, disable_web_page_preview=True)
+            except:
+                pass
+
+async def user_count(update: Update, context: CallbackContext):
+    """Admin command to check total user count"""
+    if update.effective_user.id not in [123456789]:  
+        return
+
+    count = users_collection.count_documents({})
+    await update.message.reply_text(f"👥 Total Users: {count}")
+    await update.message.delete()
+
+async def ban_user(update: Update, context: CallbackContext):
+    """Admin command to ban a user"""
+    if update.effective_user.id not in [123456789]:  
+        return
+
+    try:
+        target_user_id = int(context.args[0])
+        users_collection.delete_one({"user_id": target_user_id})
+        await context.bot.ban_chat_member(FORCESUB_GROUP_ID, target_user_id)
+        await update.message.reply_text(f"🚫 User {target_user_id} has been banned!")
+    except:
+        await update.message.reply_text("❌ Invalid User ID.")
+    await update.message.delete()
+
+async def delete_user_messages(update: Update, context: CallbackContext):
+    """Deletes user messages immediately"""
+    try:
+        await update.message.delete()
+    except:
+        pass
+
+async def restrict_message_forwarding(update: Update, context: CallbackContext):
+    """Prevents users from forwarding, copying, or saving bot messages"""
+    await update.message.reply_text(
+        "❌ Forwarding, copying, and saving messages is not allowed.",
+        disable_notification=True
+    )
+
+def start_http_server():
+    """Starts a dummy HTTP server for TCP health checks"""
+    app = Flask(__name__)
+
+    @app.route("/")
+    def health_check():
+        return "Bot is running", 200
+
+    app.run(host="0.0.0.0", port=8080)
 
 def main():
-    # Start the HTTP server in a separate thread
-    http_thread = threading.Thread(target=run_http_server)
-    http_thread.daemon = True  # Daemonize thread to exit when the main program exits
-    http_thread.start()
+    """Main function to start the bot"""
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    # Start the Telethon client
-    logger.info("Starting Telethon client...")
-    telethon_client.start()
-    logger.info("Telethon client started.")
-    telethon_client.run_until_disconnected()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("usercount", user_count))
+    app.add_handler(CommandHandler("banuser", ban_user, filters=filters.ChatType.PRIVATE))
+    app.add_handler(MessageHandler(filters.Chat(CHANNEL_ID), forward_channel_message))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.Chat(CHANNEL_ID), delete_user_messages))
+    app.add_handler(MessageHandler(filters.FORWARDED, restrict_message_forwarding))
+    app.add_handler(MessageHandler(filters.Regex("check_subscription"), check_subscription))
 
-    # Set up the bot
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
-    logger.info("Bot application initialized.")
+    threading.Thread(target=start_http_server, daemon=True).start()  
 
-    # Handlers
-    application.add_handler(CommandHandler("start", start))
-    logger.info("Command handlers registered.")
+    app.run_polling()
 
-    # Register the event handler for new channel messages
-    telethon_client.on(events.NewMessage(chats=CHANNEL_USERNAME))(handle_new_channel_message)
-    logger.info("Telethon event handler registered.")
-
-    # Start the bot
-    logger.info("Starting bot polling...")
-    application.run_polling()
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
